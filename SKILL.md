@@ -21,6 +21,8 @@ See [README.md](README.md) for installation, arguments, and recovery.
 - Preparation must not change the reader. Only use `--apply` when the user has
   authorized live upload/activation. Replacing an existing root image also
   requires approval and `--overwrite`; the script always backs it up first.
+  Explain that firmware refusing overwrite retains a second backup on the reader
+  by renaming the original to a unique name before uploading its replacement.
 - Do not publish user images, backups, recovery records, host addresses, status
   dumps, file listings, account data, or settings dumps. Settings can contain
   passwords. Report only the image dimensions, verification result, and relevant
@@ -64,13 +66,20 @@ See [README.md](README.md) for installation, arguments, and recovery.
    the `Custom` enum option; inspect root files; back up any existing `sleep.bmp`
    and record only the previous sleep mode; upload `/sleep.bmp`; download and
    compare bytes; update **only** `sleepScreen`; read back and confirm `Custom`.
+   If firmware returns the exact HTTP 400 `File already exists: sleep.bmp`, the
+   script rechecks the backed-up original, renames it to a unique device backup,
+   verifies those bytes, then uploads the replacement once. It never renames
+   without a local backup or overwrites an existing backup.
    Root `/sleep.bmp` takes priority over `.sleep`/`sleep` folders; leave them and
    all unrelated files/settings alone.
 6. On failure, report the actual error and any partial state/recovery location.
    Never claim activation if upload verification or settings read-back failed.
-   Do not automatically retry writes or roll back. Recovery actions require
+   Do not retry failed writes or roll back beyond the script's narrowly checked
+   name-collision path. Recovery actions require
    permission; use the saved original image and previous mode via `/files` and
-   `/settings`, as described in the README.
+   `/settings`, as described in the README. After a compatibility rename, the root
+   image may be temporarily absent or incomplete; keep both backups and report
+   their recovery locations. Never delete backups to make a retry succeed.
 7. On success, report byte-identical upload and confirmed Custom mode. A **device
    sleep cycle is required** to see it; the script cannot verify the physical
    e-ink display. Ask the user to inspect it rather than claiming it was observed.

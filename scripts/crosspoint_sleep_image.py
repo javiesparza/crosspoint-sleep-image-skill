@@ -37,6 +37,10 @@ class SkillError(Exception):
     """An actionable workflow failure safe to show without response dumps."""
 
 
+class UploadCollision(SkillError):
+    """The reader explicitly rejected uploading over an existing sleep.bmp."""
+
+
 class NoRedirects(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -79,6 +83,25 @@ class DeviceClient:
             urllib.request.ProxyHandler({}), NoRedirects()
         )
 
+    @staticmethod
+    def read_body(response, limit, context):
+        raw = response.read(limit + 1)
+        if len(raw) > limit:
+            raise SkillError(f"{context}: response exceeds the safety limit.")
+        length = response.headers.get("Content-Length")
+        if length is not None:
+            if not length.isdecimal() or len(raw) != int(length):
+                raise SkillError(f"{context}: truncated/invalid Content-Length.")
+        encoding = response.headers.get("Content-Encoding", "").strip().lower()
+        if encoding == "gzip":
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
+                raw = compressed.read(limit + 1)
+            if len(raw) > limit:
+                raise SkillError(f"{context}: decoded response is too large.")
+        elif encoding not in ("", "identity"):
+            raise SkillError(f"{context}: unsupported Content-Encoding.")
+        return raw
+
     def request(self, path, data=None, content_type=None, limit=MAX_RESPONSE):
         method = "GET" if data is None else "POST"
         headers = {"Accept-Encoding": "gzip"}
@@ -93,30 +116,33 @@ class DeviceClient:
             with self.opener.open(request, timeout=self.timeout) as response:
                 if response.status != 200:
                     raise SkillError(f"{method} {endpoint}: HTTP {response.status}; expected 200.")
-                raw = response.read(limit + 1)
-                if len(raw) > limit:
-                    raise SkillError(f"{method} {endpoint}: response exceeds the safety limit.")
-                length = response.headers.get("Content-Length")
-                if length is not None:
-                    if not length.isdecimal() or len(raw) != int(length):
-                        raise SkillError(f"{method} {endpoint}: truncated/invalid Content-Length.")
-                encoding = response.headers.get("Content-Encoding", "").strip().lower()
-                if encoding == "gzip":
-                    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as compressed:
-                        raw = compressed.read(limit + 1)
-                    if len(raw) > limit:
-                        raise SkillError(f"{method} {endpoint}: decoded response is too large.")
-                elif encoding not in ("", "identity"):
-                    raise SkillError(f"{method} {endpoint}: unsupported Content-Encoding.")
-                return raw
+                return self.read_body(response, limit, f"{method} {endpoint}")
         except urllib.error.HTTPError as exc:
             status = exc.code
-            exc.close()
-            detail = (
-                "Redirect refused; no redirected request was sent."
-                if 300 <= status < 400
-                else "Check firmware API compatibility and Wi-Fi File Transfer."
-            )
+            body = b""
+            try:
+                if not 300 <= status < 400:
+                    body = self.read_body(exc, 64 * 1024, f"{method} {endpoint}").strip()
+            except (SkillError, OSError, HTTPException, EOFError, zlib.error) as read_error:
+                raise SkillError(
+                    f"{method} {endpoint}: HTTP {status}; error response unreadable "
+                    f"({type(read_error).__name__})."
+                ) from read_error
+            finally:
+                exc.close()
+            if method == "POST" and endpoint == "/upload":
+                if status == 400 and body == b"File already exists: sleep.bmp":
+                    raise UploadCollision("POST /upload: HTTP 400. File already exists: sleep.bmp.") from exc
+                safe_errors = {
+                    b"Invalid file name", b"Failed to create file on SD card",
+                    b"Failed to write to SD card - disk may be full",
+                    b"Failed to write final data to SD card", b"Upload aborted",
+                    b"Unknown error during upload",
+                }
+                if body in safe_errors:
+                    raise SkillError(f"POST /upload: HTTP {status}. {body.decode('ascii')}.") from exc
+            detail = ("Redirect refused; no redirected request was sent." if 300 <= status < 400
+                      else "Check firmware API compatibility and Wi-Fi File Transfer.")
             raise SkillError(f"{method} {endpoint}: HTTP {status}. {detail}") from exc
         except (urllib.error.URLError, OSError, HTTPException, EOFError, zlib.error) as exc:
             raise SkillError(
@@ -148,6 +174,12 @@ class DeviceClient:
                 "Upload returned HTTP 200 without the expected success acknowledgement; "
                 "the device may have rejected the file."
             )
+
+    def rename_sleep(self, old_name, backup_name):
+        body = urllib.parse.urlencode({"path": "/" + old_name, "name": backup_name}).encode("ascii")
+        result = self.request("/rename", body, "application/x-www-form-urlencoded")
+        if result.strip() != b"Renamed successfully":
+            raise SkillError("Rename returned HTTP 200 without the expected success acknowledgement.")
 
 
 def screen_size(status, profile=None, size=None):
@@ -249,7 +281,7 @@ def private_write(path, data):
         os.fsync(file.fileno())
 
 
-def save_recovery(directory, previous, old_data, new_data):
+def save_recovery(directory, previous, old_data, new_data, device_backup_name):
     name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
     run = directory / name
     run.mkdir(parents=True, mode=0o700)
@@ -261,6 +293,7 @@ def save_recovery(directory, previous, old_data, new_data):
         "backup_file": "sleep.bmp" if old_data is not None else None,
         "backup_sha256": hashlib.sha256(old_data).hexdigest() if old_data is not None else None,
         "prepared_sha256": hashlib.sha256(new_data).hexdigest(),
+        "device_backup_candidate": device_backup_name,
     }
     private_write(run / "recovery.json", (json.dumps(record, indent=2) + "\n").encode("utf-8"))
     return run
@@ -280,17 +313,43 @@ def apply_image(client, data, overwrite, backup_dir):
         old_data = client.request("/download?path=" + path)
         if len(old_data) != existing["size"]:
             raise SkillError("Existing sleep.bmp download size mismatch; refusing to overwrite it.")
-    recovery = save_recovery(backup_dir, previous, old_data, data)
-    print(f"Recovery saved: {recovery} (previous sleepScreen={previous[0]})")
+    backup_name = "sleep-backup-" + uuid.uuid4().hex + ".bmp" if existing else None
+    recovery = save_recovery(backup_dir, previous, old_data, data, backup_name)
+    print(f"Recovery saved: {recovery} (previous sleepScreen={previous[0]})", flush=True)
+    backup_state = "No device-side backup rename attempted."
     try:
-        client.upload(data)
+        try:
+            client.upload(data)
+        except UploadCollision:
+            if old_data is None:
+                raise SkillError("Upload target appeared after preflight; no backed-up original to replace.")
+            if client.request("/download?path=" + path) != old_data:
+                raise SkillError("Existing sleep.bmp changed since backup; refusing to rename it.")
+            print(
+                "Reader rejected overwrite (HTTP 400: File already exists: sleep.bmp). "
+                f"Preserving the original as /{backup_name} before replacement.", flush=True
+            )
+            backup_state = (
+                f"A rename to /{backup_name} was attempted; inspect /files for its actual state."
+            )
+            client.rename_sleep(existing["name"], backup_name)
+            backup_path = urllib.parse.quote("/" + backup_name, safe="")
+            if client.request("/download?path=" + backup_path) != old_data:
+                raise SkillError("Renamed device backup does not match the original; stopping.")
+            backup_state = (
+                f"Original image verified at /{backup_name}; root /sleep.bmp may be missing or incomplete."
+            )
+            print(f"Device backup byte-verified: /{backup_name}", flush=True)
+            # Only a confirmed name collision triggers this one compatibility retry.
+            client.upload(data)
         readback = client.request("/download?path=%2Fsleep.bmp")
         if readback != data:
             raise SkillError("Uploaded sleep.bmp read-back differs from the prepared BMP.")
     except SkillError as exc:
         raise SkillError(
             f"{exc} Partial state: /sleep.bmp may have changed; no settings update was sent. "
-            f"An already-Custom mode may use the changed file. Recovery: {recovery}."
+            f"An already-Custom mode may use the changed file. {backup_state} Recovery: {recovery}. "
+            "Restore the local backup sleep.bmp through /files if needed; do not delete backups."
         ) from exc
     try:
         response = client.request(

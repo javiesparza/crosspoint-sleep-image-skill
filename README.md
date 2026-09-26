@@ -86,7 +86,8 @@ reader only). For each retry or preview-to-apply step, select a new `--output`
 path. The CLI always prepares from the input rather than uploading an arbitrary,
 unchecked BMP verbatim. `--backup-dir` selects the recovery root (default
 `backups`), and `--timeout` sets a finite positive socket timeout (default 15
-seconds). Requests are not automatically retried.
+seconds). Network failures are not automatically retried. A specifically
+recognized upload-name collision has the one safe compatibility path below.
 
 ### Edge-to-edge artwork
 
@@ -113,21 +114,30 @@ command with a new output path.
 3. Read `/api/files?path=%2F`. If root `sleep.bmp` exists, require `--overwrite`,
    download it, and verify its length against the listing before any write.
 4. Create a unique local recovery directory with the original `sleep.bmp` (when
-   present) and a small `recovery.json` containing only the previous sleep mode
-   and image hashes. Flush the files to disk before uploading.
+   present) and a small `recovery.json` containing only the previous sleep mode,
+   image hashes, and a generated device-backup candidate filename. Flush the
+   files to disk before uploading.
 5. POST multipart field `file`, filename `sleep.bmp`, to `/upload?path=%2F`.
-   No `Expect: 100-continue` is sent.
+   No `Expect: 100-continue` is sent. Some firmware rejects existing targets with
+   HTTP 400 `File already exists: sleep.bmp` instead of overwriting. Only for
+   that exact response, and only with a backed-up original and `--overwrite`,
+   re-download the original to check it is unchanged, rename it via `/rename`
+   to a unique root `sleep-backup-<random>.bmp`, verify the renamed file's bytes,
+   and upload the new `/sleep.bmp` once. Rename collisions are refused, and both
+   local and device backups are kept. Other errors never trigger this path.
 6. GET `/download?path=%2Fsleep.bmp` and require exact byte equality to the
    prepared file before touching settings.
 7. POST **only** `{"sleepScreen": <discovered Custom index>}` to `/api/settings`
    and read the settings back to confirm Custom mode.
 
-Only `/sleep.bmp` and the sleep-screen mode are changed. Root `/sleep.bmp` takes
-priority over `.sleep`/`sleep` image folders; nothing in those folders is
-modified or deleted. System/environment proxies are bypassed, redirects are
+Only the selected sleep image and sleep-screen mode are changed; on firmware
+that refuses overwrite, the old image is also retained under a generated backup
+name. Root `/sleep.bmp` takes priority over `.sleep`/`sleep` image folders; nothing
+in those folders is modified or deleted. System/environment proxies are bypassed, redirects are
 refused (including upload redirects), gzip responses are supported, and actual
-HTTP status plus endpoint-specific acknowledgement bodies are checked. Raw
-responses/status/settings/file listings are never printed.
+HTTP status plus endpoint-specific acknowledgement bodies are checked. Known,
+allowlisted upload errors are shown; raw responses/status/settings/file listings
+are never printed.
 
 **Success means byte-identical read-back and confirmed Custom mode, not an
 observed physical display.** Exit File Transfer when appropriate and perform a
@@ -143,11 +153,22 @@ reader may still use the changed file. If activation or its read-back fails,
 the image is verified but the active mode is uncertain. Errors exit nonzero and
 include the recovery directory once live writes have begun.
 
+The compatibility rename leaves a brief interval with no root `/sleep.bmp`.
+If replacement then fails, the original remains in the local backup and, after
+a verified rename, in the device backup. A failed rename response is ambiguous;
+inspect `/files` before doing anything else. `device_backup_candidate` in
+`recovery.json` records the planned name before mutation; it may not exist if
+rename was unnecessary or failed. The error reports whether rename was
+attempted or the device backup was byte-verified.
+
 No automatic rollback is attempted: a second write can also fail or overwrite a
 concurrent change. Keep the recovery directory private. To recover, with the
 owner's permission, open the reader's `/files` page and upload the original
-backup file named `sleep.bmp` to the root. Use `/settings` to restore the previous
-mode recorded in `recovery.json`; check the current option labels rather than
+backup file named `sleep.bmp` to the root. If a root image already exists and
+the firmware refuses overwrite, first rename that root image to another unused
+name rather than deleting it. Alternatively, if root `sleep.bmp` is absent,
+rename the retained device backup back to `sleep.bmp`. Use `/settings` to restore
+the previous mode recorded in `recovery.json`; check the current option labels rather than
 blindly reusing an index after a firmware update. Download the restored file to
 compare it with the backup. If there was no old root image, the record says
 `backup_file: null`; restoring the previous mode may suffice, while returning to
@@ -160,7 +181,7 @@ file through the UI. The CLI never deletes files.
 | --- | --- |
 | DNS/connection timeout | Wake the reader, enable Wi-Fi File Transfer, join the same network, wait for the server, then retry. A failed first `.local` request does not prove the reader is absent. Use the address shown on the reader with `--host` if mDNS fails. |
 | HTTP errors or invalid JSON/schema | Check `/`, `/files`, and `/settings` in a browser. Firmware APIs may differ; this tool refuses ambiguous responses rather than guessing. No need to inspect browser history. |
-| Existing root image | Review replacement intent, then use `--overwrite`; backup remains mandatory. |
+| Existing root image | Review replacement intent, then use `--overwrite`; local backup remains mandatory, and firmware that rejects overwrites also retains a renamed device backup. |
 | Backup/read-back mismatch or truncated response | Stop and inspect connectivity/storage. Do not activate unverified artwork; retain the local recovery directory. |
 | Output already exists | Choose another `--output` path. No local overwrite flag is provided. |
 | Invalid input | Use a readable single-frame format supported by the installed Pillow build, such as JPEG or PNG. Multi-frame/animated files and oversized inputs triggering Pillow's safety checks are rejected. |

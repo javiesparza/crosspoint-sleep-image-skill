@@ -1,4 +1,4 @@
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 import argparse
 import copy
 from email import policy
@@ -17,6 +17,8 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+import urllib.parse
+import uuid
 
 from PIL import Image, ImageChops, ImageDraw
 
@@ -45,6 +47,13 @@ class FakeReader:
         self.upload_ack = b"File uploaded successfully: sleep.bmp"
         self.settings_ack = b"Applied 1 setting(s)"
         self.after_settings = None
+        self.reject_existing_uploads = False
+        self.device_backups = {}
+        self.change_after_collision = False
+        self.corrupt_device_backup = False
+        self.fail_replacement = False
+        self.rename_ack = b"Renamed successfully"
+        self.uploaded = False
 
     def handle(self, method, path, body, headers):
         self.requests.append((method, path, body, headers))
@@ -57,11 +66,15 @@ class FakeReader:
                 return 200, json.dumps(self.settings).encode(), {}
             if path == "/api/files?path=%2F":
                 return 200, json.dumps(self.files).encode(), {}
+            if path.startswith("/download?"):
+                name = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["path"][0].lstrip("/")
+                if name in self.device_backups:
+                    data = self.device_backups[name]
+                    return 200, data[:-1] if self.corrupt_device_backup else data, {}
             if path.lower() == "/download?path=%2fsleep.bmp":
                 if self.image is None:
                     return 404, b"not found", {}
-                uploaded = any(request[0] == "POST" for request in self.requests)
-                data = self.image[:-1] if self.corrupt_readback and uploaded else self.image
+                data = self.image[:-1] if self.corrupt_readback and self.uploaded else self.image
                 return 200, data, {}
         if method == "POST" and path == "/upload?path=%2F":
             message = BytesParser(policy=policy.default).parsebytes(
@@ -76,8 +89,28 @@ class FakeReader:
                 or "Expect" in headers
             ):
                 return 400, b"invalid multipart", {}
+            if self.reject_existing_uploads and self.image is not None:
+                if self.change_after_collision:
+                    self.image = b"concurrent change"
+                return 400, b"File already exists: sleep.bmp", {}
+            if self.fail_replacement and self.device_backups:
+                return 400, b"Failed to create file on SD card", {}
             self.image = parts[0].get_payload(decode=True)
+            self.uploaded = True
             return 200, self.upload_ack, {}
+        if method == "POST" and path == "/rename":
+            form = urllib.parse.parse_qs(body.decode())
+            if (form["path"][0].lower() != "/sleep.bmp"
+                    or headers["Content-Type"] != "application/x-www-form-urlencoded"):
+                return 400, b"invalid rename", {}
+            target = form["name"][0]
+            if target in self.device_backups:
+                return 409, b"Target already exists", {}
+            if self.image is None:
+                return 404, b"Item not found", {}
+            self.device_backups[target] = self.image
+            self.image = None
+            return 200, self.rename_ack, {}
         if method == "POST" and path == "/api/settings":
             changes = json.loads(body)
             if list(changes) != ["sleepScreen"] or headers["Content-Type"] != "application/json":
@@ -396,6 +429,89 @@ class WorkflowTests(unittest.TestCase):
                 self.assert_no_writes()
                 self.output.unlink()
 
+    def prepare_collision(self):
+        self.device.image = b"original image"
+        self.device.files.append({"name": "sleep.bmp", "isDirectory": False,
+                                  "size": len(self.device.image)})
+        self.device.reject_existing_uploads = True
+
+    def test_collision_firmware_preserves_and_verifies_device_backup(self):
+        self.prepare_collision()
+        self.device.gzip = True
+        old = self.device.image
+        unrelated = copy.deepcopy(self.device.settings[1:])
+        with fake_server(self.device) as host:
+            code, stdout, stderr = self.run_cli(host, "--apply", "--overwrite")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("HTTP 400: File already exists", stdout)
+        self.assertIn("Device backup byte-verified", stdout)
+        self.assertEqual(list(self.device.device_backups.values()), [old])
+        backup_name = next(iter(self.device.device_backups))
+        record_file = next(self.backups.glob("*/recovery.json"))
+        self.assertEqual(json.loads(record_file.read_text())["device_backup_candidate"], backup_name)
+        self.assertEqual(record_file.with_name("sleep.bmp").read_bytes(), old)
+        self.assertEqual(self.device.image, self.output.read_bytes())
+        self.assertEqual(self.device.settings[1:], unrelated)
+        sequence = self.request_sequence()
+        self.assertEqual(sequence.count(("POST", "/upload?path=%2F")), 2)
+        rename = sequence.index(("POST", "/rename"))
+        self.assertEqual(sequence[rename - 1], ("GET", "/download?path=%2Fsleep.bmp"))
+        self.assertEqual(sequence[rename + 1], ("GET", "/download?path=%2F" + backup_name))
+        self.assertEqual(sequence[rename + 2], ("POST", "/upload?path=%2F"))
+        self.assertFalse(any("delete" in path for _, path in sequence))
+
+    def test_collision_fallback_failures_preserve_backups_and_do_not_activate(self):
+        for failure in ("changed", "rename", "rename_ack", "backup", "upload", "readback", "name_collision"):
+            with self.subTest(failure=failure):
+                self.device = FakeReader()
+                self.prepare_collision()
+                old = self.device.image
+                if failure == "changed":
+                    self.device.change_after_collision = True
+                elif failure == "rename":
+                    self.device.failures[("POST", "/rename")] = (500, b"failed", {})
+                elif failure == "rename_ack":
+                    self.device.rename_ack = b"unexpected acknowledgement"
+                elif failure == "backup":
+                    self.device.corrupt_device_backup = True
+                elif failure == "upload":
+                    self.device.fail_replacement = True
+                elif failure == "readback":
+                    self.device.corrupt_readback = True
+                else:
+                    self.device.device_backups["sleep-backup-" + uuid.UUID(int=1).hex + ".bmp"] = b"unrelated"
+                fixed_name = (patch.object(skill.uuid, "uuid4", return_value=uuid.UUID(int=1))
+                              if failure == "name_collision" else nullcontext())
+                with fixed_name:
+                    with fake_server(self.device) as host:
+                        code, _, stderr = self.run_cli(host, "--apply", "--overwrite")
+                self.assertEqual(code, 1)
+                self.assertIn("Partial state", stderr)
+                self.assertIn("Restore the local backup", stderr)
+                self.assert_no_settings_write()
+                self.assertFalse(any("delete" in path for _, path in self.request_sequence()))
+                self.assertTrue(any(file.read_bytes() == old for file in self.backups.glob("*/sleep.bmp")))
+                if failure == "changed":
+                    self.assertNotIn(("POST", "/rename"), self.request_sequence())
+                elif failure == "name_collision":
+                    self.assertEqual(list(self.device.device_backups.values()), [b"unrelated"])
+                    self.assertEqual(self.device.image, old)
+                elif failure == "rename":
+                    self.assertEqual(self.device.image, old)
+                else:
+                    self.assertEqual(list(self.device.device_backups.values()), [old])
+                self.output.unlink()
+
+    def test_collision_without_backed_up_original_never_renames(self):
+        self.device.image = b"image not present in preflight listing"
+        self.device.reject_existing_uploads = True
+        with fake_server(self.device) as host:
+            code, _, stderr = self.run_cli(host, "--apply", "--overwrite")
+        self.assertEqual(code, 1)
+        self.assertIn("appeared after preflight", stderr)
+        self.assertNotIn(("POST", "/rename"), self.request_sequence())
+        self.assert_no_settings_write()
+
     def test_failed_upload_ack_status_or_readback_never_activates(self):
         for failure in ("http", "ack", "readback", "download"):
             with self.subTest(failure=failure):
@@ -516,6 +632,21 @@ class TransportTests(unittest.TestCase):
         ):
             client = skill.DeviceClient(host)
             self.assertEqual(client.get_json("/api/status")["device"], "X3")
+
+    def test_error_body_allowlist_and_invalid_gzip_keep_http_status(self):
+        cases = [
+            (b"Failed to write to SD card - disk may be full", {}, "disk may be full"),
+            (PRIVATE_SENTINEL.encode(), {}, "HTTP 400"),
+            (b"bad gzip", {"Content-Encoding": "gzip"}, "HTTP 400; error response unreadable"),
+        ]
+        for body, headers, message in cases:
+            with self.subTest(message=message):
+                device = FakeReader()
+                device.failures[("POST", "/upload?path=%2F")] = (400, body, headers)
+                with fake_server(device) as host:
+                    with self.assertRaisesRegex(skill.SkillError, message) as caught:
+                        skill.DeviceClient(host).upload(b"image")
+                self.assertNotIn(PRIVATE_SENTINEL, str(caught.exception))
 
     def test_http_error_status_invalid_json_encoding_and_truncation(self):
         cases = [
