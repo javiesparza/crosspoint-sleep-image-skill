@@ -1,0 +1,31 @@
+# Local environments, credentials, and Python caches.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+.env.*
+.DS_Store
+
+# Generated output and recovery records can contain private artwork/settings.
+output/
+backups/
+recovery/
+*.log
+*.bak
+
+# Never commit personal image inputs or generated image files.
+*.[bB][mM][pP]
+*.[jJ][pP][gG]
+*.[jJ][pP][eE][gG]
+*.[pP][nN][gG]
+*.[gG][iI][fF]
+*.[wW][eE][bB][pP]
+*.[tT][iI][fF]
+*.[tT][iI][fF][fF]
+*.[hH][eE][iI][cC]
+*.[aA][vV][iI][fF]
+*.[pP][dD][fF]
+*.[sS][vV][gG]
